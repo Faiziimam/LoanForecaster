@@ -5,7 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from loan_calculator import LoanCalculator
-from utils import format_currency, calculate_interest_savings, export_to_csv
+from utils import format_currency, calculate_interest_savings, export_to_csv, analyze_payment_history, validate_payment_data
 import io
 
 # Page configuration
@@ -15,20 +15,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# --- Caching ---
-@st.cache_data
-def get_amortization_schedule(loan_amount, annual_rate, tenure_years, monthly_prepayment, quarterly_prepayment, max_months):
-    calculator = LoanCalculator(
-        loan_amount=loan_amount,
-        annual_rate=annual_rate,
-        tenure_years=tenure_years
-    )
-    return calculator.generate_amortization_schedule(
-        monthly_prepayment=monthly_prepayment,
-        quarterly_prepayment=quarterly_prepayment,
-        max_months=max_months
-    )
 
 # Main title
 st.title("🏦 Loan Prepayment Calculator & Amortization Analyzer")
@@ -122,15 +108,17 @@ if st.sidebar.button("🔄 Calculate & Analyze", type="primary"):
         )
         
         # Generate amortization schedule with prepayments
-        schedule = get_amortization_schedule(
-            loan_amount, interest_rate, tenure_years,
-            monthly_prepayment, quarterly_prepayment, analysis_months
+        schedule = calculator.generate_amortization_schedule(
+            monthly_prepayment=monthly_prepayment,
+            quarterly_prepayment=quarterly_prepayment,
+            max_months=analysis_months
         )
         
         # Generate comparison data (without prepayments)
-        schedule_no_prepay = get_amortization_schedule(
-            loan_amount, interest_rate, tenure_years,
-            0, 0, analysis_months
+        schedule_no_prepay = calculator.generate_amortization_schedule(
+            monthly_prepayment=0,
+            quarterly_prepayment=0,
+            max_months=analysis_months
         )
         
         # Store in session state
@@ -433,6 +421,313 @@ if st.session_state.calculator is not None:
         
         for key, value in stats_without.items():
             st.metric(key, value)
+
+    # Payment History Analysis Section
+    st.markdown("---")
+    st.header("📊 Payment History Analysis")
+    st.markdown("Upload your payment history to get personalized loan analysis and recommendations.")
+    
+    # File upload
+    uploaded_file = st.file_uploader(
+        "Upload your payment history (Excel file)",
+        type=['xlsx', 'xls'],
+        help="Excel file should contain columns: amount_paid, month, payment_date (optional), notes (optional)"
+    )
+    
+    if uploaded_file is not None:
+        try:
+            # Read the uploaded file
+            payment_data = pd.read_excel(uploaded_file)
+            
+            # Display column information
+            st.subheader("📋 Data Preview")
+            st.write(f"**File uploaded successfully!** Found {len(payment_data)} records with columns: {', '.join(payment_data.columns.tolist())}")
+            
+            # Show sample data
+            with st.expander("Preview uploaded data", expanded=False):
+                st.dataframe(payment_data.head(10), use_container_width=True)
+            
+            # Column mapping section
+            st.subheader("🔗 Column Mapping")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                amount_col = st.selectbox(
+                    "Amount Paid Column",
+                    options=payment_data.columns.tolist(),
+                    help="Select the column containing payment amounts"
+                )
+            
+            with col2:
+                month_col = st.selectbox(
+                    "Month Column",
+                    options=payment_data.columns.tolist(),
+                    help="Select the column containing month numbers (1, 2, 3...)"
+                )
+            
+            with col3:
+                date_col = st.selectbox(
+                    "Payment Date Column (Optional)",
+                    options=["None"] + payment_data.columns.tolist(),
+                    help="Select the column containing payment dates"
+                )
+            
+            with col4:
+                notes_col = st.selectbox(
+                    "Notes Column (Optional)",
+                    options=["None"] + payment_data.columns.tolist(),
+                    help="Select the column containing payment notes"
+                )
+            
+            # Process the data
+            if st.button("🔍 Analyze Payment History", type="primary"):
+                try:
+                    # Create standardized DataFrame
+                    analysis_df = pd.DataFrame()
+                    analysis_df['amount_paid'] = payment_data[amount_col]
+                    analysis_df['month'] = payment_data[month_col]
+                    
+                    if date_col != "None":
+                        analysis_df['payment_date'] = payment_data[date_col]
+                    
+                    if notes_col != "None":
+                        analysis_df['notes'] = payment_data[notes_col]
+                    
+                    # Validate the data
+                    validation_errors = validate_payment_data(analysis_df)
+                    
+                    if validation_errors:
+                        st.error("Data validation failed:")
+                        for error in validation_errors:
+                            st.error(f"• {error}")
+                    else:
+                        # Perform analysis
+                        analysis_results = analyze_payment_history(
+                            analysis_df, 
+                            loan_amount, 
+                            interest_rate, 
+                            calculator.emi
+                        )
+                        
+                        # Store results in session state
+                        st.session_state.payment_analysis = analysis_results
+                        st.session_state.payment_data = analysis_df
+                        
+                        st.success("✅ Payment history analyzed successfully!")
+                        
+                except Exception as e:
+                    st.error(f"Error during analysis: {str(e)}")
+            
+            # Display analysis results if available
+            if 'payment_analysis' in st.session_state:
+                results = st.session_state.payment_analysis
+                
+                st.markdown("---")
+                st.header("📈 Payment Analysis Results")
+                
+                # Summary metrics
+                st.subheader("📊 Payment Summary")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric(
+                        "Total Paid",
+                        format_currency(results['payment_summary']['total_paid']),
+                        help="Total amount paid so far"
+                    )
+                
+                with col2:
+                    st.metric(
+                        "Months Completed",
+                        f"{results['payment_summary']['months_completed']} months",
+                        help="Number of months for which payments were made"
+                    )
+                
+                with col3:
+                    st.metric(
+                        "Total Overpayments",
+                        format_currency(results['payment_summary']['total_overpayment']),
+                        delta=f"+{format_currency(results['payment_summary']['total_overpayment'])}",
+                        help="Amount paid above regular EMI"
+                    )
+                
+                with col4:
+                    st.metric(
+                        "Loan Completion",
+                        f"{results['loan_status']['loan_completion_percentage']:.1f}%",
+                        help="Percentage of loan principal paid off"
+                    )
+                
+                # Current loan status
+                st.subheader("🎯 Current Loan Status")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric(
+                        "Remaining Balance",
+                        format_currency(results['loan_status']['remaining_balance']),
+                        help="Outstanding loan amount"
+                    )
+                
+                with col2:
+                    remaining_months = results['loan_status']['remaining_months']
+                    years = int(remaining_months // 12)
+                    months = int(remaining_months % 12)
+                    st.metric(
+                        "Estimated Time Left",
+                        f"{years}y {months}m",
+                        help="Time remaining if continuing with current EMI"
+                    )
+                
+                with col3:
+                    st.metric(
+                        "Interest Savings",
+                        format_currency(results['loan_status']['estimated_interest_savings']),
+                        delta=f"-{format_currency(results['loan_status']['estimated_interest_savings'])}",
+                        help="Estimated interest saved through overpayments"
+                    )
+                
+                # Visualizations
+                st.subheader("📈 Payment Pattern Visualization")
+                
+                # Payment history chart
+                payment_df = pd.DataFrame(results['monthly_breakdown'])
+                
+                fig_payments = go.Figure()
+                
+                fig_payments.add_trace(go.Bar(
+                    x=payment_df['month'],
+                    y=payment_df['expected_emi'],
+                    name='Expected EMI',
+                    marker_color='lightblue',
+                    opacity=0.7
+                ))
+                
+                fig_payments.add_trace(go.Bar(
+                    x=payment_df['month'],
+                    y=payment_df['amount_paid'],
+                    name='Actual Payment',
+                    marker_color='darkblue'
+                ))
+                
+                fig_payments.add_trace(go.Scatter(
+                    x=payment_df['month'],
+                    y=payment_df['remaining_balance'],
+                    mode='lines+markers',
+                    name='Remaining Balance',
+                    yaxis='y2',
+                    line=dict(color='red', width=3),
+                    marker=dict(size=6)
+                ))
+                
+                fig_payments.update_layout(
+                    title="Payment History vs Expected EMI",
+                    xaxis_title="Month",
+                    yaxis_title="Payment Amount (₹)",
+                    yaxis2=dict(
+                        title="Remaining Balance (₹)",
+                        overlaying='y',
+                        side='right'
+                    ),
+                    barmode='group',
+                    template='plotly_white',
+                    hovermode='x unified'
+                )
+                
+                st.plotly_chart(fig_payments, use_container_width=True)
+                
+                # Payment breakdown pie chart
+                st.subheader("💰 Payment Breakdown")
+                
+                fig_pie = go.Figure(data=[go.Pie(
+                    labels=['Interest Paid', 'Principal Paid', 'Overpayments'],
+                    values=[
+                        results['payment_summary']['total_interest_paid'],
+                        results['payment_summary']['total_principal_paid'] - results['payment_summary']['total_overpayment'],
+                        results['payment_summary']['total_overpayment']
+                    ],
+                    hole=0.3,
+                    marker_colors=['#ff6b6b', '#4ecdc4', '#45b7d1']
+                )])
+                
+                fig_pie.update_layout(
+                    title="Where Your Money Went",
+                    template='plotly_white'
+                )
+                
+                st.plotly_chart(fig_pie, use_container_width=True)
+                
+                # Personalized recommendations
+                st.subheader("💡 Personalized Recommendations")
+                
+                for recommendation in results['recommendations']:
+                    st.info(recommendation)
+                
+                # Detailed payment history table
+                st.subheader("📋 Detailed Payment History")
+                
+                display_payment_df = payment_df.copy()
+                currency_cols = ['amount_paid', 'expected_emi', 'expected_interest', 'expected_principal', 
+                               'actual_interest', 'actual_principal', 'overpayment', 'remaining_balance']
+                
+                for col in currency_cols:
+                    if col in display_payment_df.columns:
+                        display_payment_df[col] = display_payment_df[col].apply(lambda x: f"₹{x:,.0f}")
+                
+                st.dataframe(
+                    display_payment_df,
+                    use_container_width=True,
+                    height=400
+                )
+                
+                # Export functionality
+                if st.button("📥 Download Payment Analysis"):
+                    analysis_csv = export_to_csv(payment_df)
+                    st.download_button(
+                        label="💾 Download Analysis Report",
+                        data=analysis_csv,
+                        file_name=f"payment_analysis_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+        
+        except Exception as e:
+            st.error(f"Error reading file: {str(e)}")
+            st.info("Please ensure your Excel file contains the required columns: amount_paid, month")
+    
+    else:
+        # Sample data template
+        st.subheader("📝 Excel File Format")
+        st.markdown("Your Excel file should contain the following columns:")
+        
+        sample_data = pd.DataFrame({
+            'amount_paid': [58000, 62000, 59500, 65000, 61000],
+            'month': [1, 2, 3, 4, 5],
+            'payment_date': ['2024-01-15', '2024-02-15', '2024-03-15', '2024-04-15', '2024-05-15'],
+            'notes': ['Regular EMI', 'EMI + bonus', 'Regular EMI', 'Extra payment', 'Regular EMI']
+        })
+        
+        st.dataframe(sample_data, use_container_width=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Required Columns:**")
+            st.markdown("• `amount_paid` - Payment amount in rupees")
+            st.markdown("• `month` - Month number (1, 2, 3...)")
+        
+        with col2:
+            st.markdown("**Optional Columns:**")
+            st.markdown("• `payment_date` - Date of payment")
+            st.markdown("• `notes` - Payment notes/comments")
+        
+        # Download sample template
+        if st.button("📥 Download Sample Template"):
+            sample_csv = sample_data.to_csv(index=False)
+            st.download_button(
+                label="💾 Download Excel Template",
+                data=sample_csv,
+                file_name="payment_history_template.csv",
+                mime="text/csv"
+            )
 
 else:
     # Welcome screen

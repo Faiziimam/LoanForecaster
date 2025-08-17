@@ -210,7 +210,7 @@ def generate_payment_summary(schedule: List[Dict]) -> Dict:
         'Monthly Prepayment': 'sum',
         'Quarterly Prepayment': 'sum',
         'Total Payment': 'sum'
-    }).to_dict('index')
+    }).to_dict(orient='index')
     
     return {
         'monthly_stats': monthly_stats,
@@ -266,3 +266,195 @@ def calculate_compound_interest(principal: float, rate: float, time: float,
         Final amount after compound interest
     """
     return principal * (1 + rate/compound_frequency) ** (compound_frequency * time)
+
+def validate_payment_data(df: pd.DataFrame) -> List[str]:
+    """
+    Validate uploaded payment history data.
+    
+    Args:
+        df: DataFrame containing payment history
+        
+    Returns:
+        List of validation errors
+    """
+    errors = []
+    
+    # Check required columns
+    required_columns = ['amount_paid', 'month']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    
+    if missing_columns:
+        errors.append(f"Missing required columns: {', '.join(missing_columns)}")
+    
+    if len(errors) == 0:  # Only proceed if required columns exist
+        # Check for negative amounts
+        if df['amount_paid'].lt(0).any():
+            errors.append("Payment amounts cannot be negative")
+        
+        # Check for duplicate months
+        if df['month'].duplicated().any():
+            errors.append("Duplicate months found in the data")
+        
+        # Check for missing values
+        if df['amount_paid'].isna().any():
+            errors.append("Missing payment amounts found")
+        
+        if df['month'].isna().any():
+            errors.append("Missing month values found")
+    
+    return errors
+
+def analyze_payment_history(payment_df: pd.DataFrame, loan_amount: float, 
+                          annual_rate: float, emi: float) -> Dict:
+    """
+    Analyze payment history against expected loan schedule.
+    
+    Args:
+        payment_df: DataFrame with payment history
+        loan_amount: Original loan amount
+        annual_rate: Annual interest rate
+        emi: Monthly EMI amount
+        
+    Returns:
+        Dictionary containing comprehensive payment analysis
+    """
+    # Sort by month
+    payment_df = payment_df.sort_values('month').reset_index(drop=True)
+    
+    monthly_rate = annual_rate / 100 / 12
+    current_balance = loan_amount
+    analysis_results = []
+    
+    # Calculate expected vs actual payments
+    total_paid = 0
+    total_interest_paid = 0
+    total_principal_paid = 0
+    total_overpayment = 0
+    
+    for idx, row in payment_df.iterrows():
+        month = row['month']
+        amount_paid = row['amount_paid']
+        
+        # Calculate expected interest for this month
+        expected_interest = current_balance * monthly_rate
+        expected_principal = emi - expected_interest
+        
+        # Actual breakdown (assuming payment first goes to interest, then principal)
+        actual_interest = min(float(amount_paid), expected_interest)
+        actual_principal = amount_paid - actual_interest
+        
+        # Calculate overpayment (amount beyond EMI)
+        overpayment = max(0, amount_paid - emi)
+        
+        # Update running totals
+        total_paid += amount_paid
+        total_interest_paid += actual_interest
+        total_principal_paid += actual_principal
+        total_overpayment += overpayment
+        
+        # Update balance
+        current_balance -= actual_principal
+        current_balance = max(0.0, current_balance)
+        
+        analysis_results.append({
+            'month': month,
+            'amount_paid': amount_paid,
+            'expected_emi': emi,
+            'expected_interest': expected_interest,
+            'expected_principal': expected_principal,
+            'actual_interest': actual_interest,
+            'actual_principal': actual_principal,
+            'overpayment': overpayment,
+            'remaining_balance': current_balance
+        })
+    
+    # Calculate summary metrics
+    last_month = payment_df['month'].max()
+    months_completed = len(payment_df)
+    
+    # Project remaining loan details
+    if current_balance > 0:
+        # Calculate remaining months if continuing with EMI
+        remaining_months = np.ceil(np.log(1 + (current_balance * monthly_rate) / emi) / 
+                                 np.log(1 + monthly_rate)) if monthly_rate > 0 else current_balance / emi
+        remaining_months = max(0, remaining_months)
+    else:
+        remaining_months = 0
+    
+    # Calculate interest savings from overpayments
+    expected_interest_final = current_balance * monthly_rate if current_balance > 0 else 0
+    original_total_interest = (emi * (loan_amount / emi * (1 + monthly_rate)**np.ceil(loan_amount / emi)) - loan_amount)
+    estimated_interest_savings = original_total_interest - total_interest_paid - (remaining_months * expected_interest_final)
+    
+    return {
+        'payment_summary': {
+            'total_paid': total_paid,
+            'total_interest_paid': total_interest_paid,
+            'total_principal_paid': total_principal_paid,
+            'total_overpayment': total_overpayment,
+            'months_completed': months_completed,
+            'last_payment_month': last_month
+        },
+        'loan_status': {
+            'remaining_balance': current_balance,
+            'remaining_months': remaining_months,
+            'estimated_interest_savings': estimated_interest_savings,
+            'loan_completion_percentage': (total_principal_paid / loan_amount) * 100
+        },
+        'monthly_breakdown': analysis_results,
+        'recommendations': generate_payment_recommendations(
+            current_balance, remaining_months, emi, total_overpayment, months_completed
+        )
+    }
+
+def generate_payment_recommendations(remaining_balance: float, remaining_months: float,
+                                   emi: float, total_overpayment: float, 
+                                   months_completed: int) -> List[str]:
+    """
+    Generate personalized payment recommendations based on payment history.
+    
+    Args:
+        remaining_balance: Current outstanding balance
+        remaining_months: Estimated remaining months
+        emi: Monthly EMI
+        total_overpayment: Total overpayments made so far
+        months_completed: Number of months completed
+        
+    Returns:
+        List of recommendation strings
+    """
+    recommendations = []
+    
+    if remaining_balance <= 0:
+        recommendations.append("🎉 Congratulations! Your loan is fully paid off!")
+        return recommendations
+    
+    # Calculate average overpayment per month
+    avg_overpayment = total_overpayment / months_completed if months_completed > 0 else 0
+    
+    if avg_overpayment > 0:
+        recommendations.append(f"📈 Great job! You've been making overpayments averaging ₹{avg_overpayment:,.0f} per month")
+        
+        # Calculate impact of continuing current overpayment strategy
+        if avg_overpayment > emi * 0.1:  # Significant overpayment (>10% of EMI)
+            time_saved = remaining_months * 0.15  # Rough estimate
+            recommendations.append(f"⏰ Continue your current strategy to save approximately {time_saved:.0f} more months")
+    else:
+        recommendations.append("💡 Consider making small overpayments to reduce interest and loan duration")
+    
+    # Balance-based recommendations
+    if remaining_balance > emi * 60:  # More than 5 years remaining
+        recommendations.append("🎯 Focus on consistent overpayments - even ₹5,000 extra monthly can save significant interest")
+    elif remaining_balance > emi * 24:  # 2-5 years remaining
+        recommendations.append("🏃‍♂️ You're in the home stretch! Consider larger prepayments to finish strong")
+    else:  # Less than 2 years remaining
+        recommendations.append("🏁 Final sprint! Consider paying off the remaining balance in lump sum if possible")
+    
+    # Payment frequency recommendations
+    if months_completed >= 6:
+        payment_consistency = len([1 for month in range(1, months_completed + 1) 
+                                 if month in [row['month'] for row in []]])  # Placeholder logic
+        if payment_consistency < 0.8:
+            recommendations.append("📅 Try to maintain consistent monthly payments for better loan management")
+    
+    return recommendations

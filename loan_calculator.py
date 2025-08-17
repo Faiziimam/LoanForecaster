@@ -59,7 +59,8 @@ class LoanCalculator:
         """
         schedule = []
         outstanding_balance = self.loan_amount
-        max_months = max_months or self.tenure_months
+        if max_months is None:
+            max_months = self.tenure_months
         
         for month in range(1, max_months + 1):
             if outstanding_balance <= 0:
